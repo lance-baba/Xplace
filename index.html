@@ -580,7 +580,7 @@ function makeLeafCluster(r, seed){
   const leaves = [];
   const cols = [];
   const cA = new THREE.Color(S.leaf[2]), cB = new THREE.Color(S.leaf[0]), cC = new THREE.Color(S.leaf[1]);
-  const nLeaves = 36;
+  const nLeaves = 55;
   for(let i=0;i<nLeaves;i++){
     // leaf blade: plane tapered to pointed tips, folded along center vein
     const lw = 0.24*r, ll = 0.68*r;
@@ -729,25 +729,34 @@ const FERN_N = 400;
 
 /* ---------------- tree: bent trunk + branches + leaf puffs ---------------- */
 function makeTrunk(h, r0, r1, seed){
-  const g = new THREE.CylinderGeometry(r1, r0, h, 8, 6);
+  const g = new THREE.CylinderGeometry(r1, r0, h, 12, 8);
   g.translate(0, h/2, 0);
   const p = g.attributes.position;
+  const cols = new Float32Array(p.count*3);
+  const barkA = new THREE.Color(0x4a3a28), barkB = new THREE.Color(0x6b5638), barkC = new THREE.Color(0x2e2418);
   const v = new THREE.Vector3();
   const bendA = (rnd()-0.5)*0.5, bendP = rnd()*Math.PI*2;
   for(let i=0;i<p.count;i++){
     v.set(p.getX(i), p.getY(i), p.getZ(i));
     const t = v.y / h;
-    // gentle bend + root flare + bark lumps
+    const ang = Math.atan2(v.z, v.x);
+    // gentle bend + root flare
     v.x += Math.sin(t*2.2+bendP)*bendA*t*h*0.35;
     v.z += Math.cos(t*1.7+bendP)*bendA*t*h*0.25;
-    const flare = 1 + (1-t)*(1-t)*0.9;
+    const flare = 1 + (1-t)*(1-t)*1.2;
     v.x *= flare; v.z *= flare;
-    const b = 1 + (vnoise2(v.y*4+seed, Math.atan2(v.z,v.x)*2)-0.5)*0.28;
+    // bark: vertical ridges (grooves) + lumps
+    const ridge = vnoise2(ang*3.0+seed, v.y*1.5)*0.5 + vnoise2(ang*7.0-seed, v.y*4.0)*0.3;
+    const b = 1 + (ridge-0.4)*0.22 + (vnoise2(v.y*4+seed, ang*2)-0.5)*0.12;
     v.x *= b; v.z *= b;
     p.setXYZ(i, v.x, v.y, v.z);
+    // bark color: darker in grooves, lighter on ridges
+    const cc = barkC.clone().lerp(barkA, THREE.MathUtils.clamp(ridge*1.4,0,1)).lerp(barkB, vnoise2(v.y*2+seed*2, ang*1.5)*0.35);
+    cols[i*3]=cc.r; cols[i*3+1]=cc.g; cols[i*3+2]=cc.b;
   }
+  g.setAttribute('color', new THREE.BufferAttribute(cols, 3));
   g.computeVertexNormals();
-  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({color:S.trunk, roughness:1}));
+  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({vertexColors:true, roughness:1}));
   m.userData.topY = h;
   return m;
 }
@@ -755,7 +764,7 @@ function makeTree(x, z, s, seed, species){
   species = species || 0; // 0=broadleaf, 1=conifer
   const isConifer = species === 1;
   const g = new THREE.Group();
-  const barkMat = new THREE.MeshStandardMaterial({color:S.trunk, roughness:1});
+  const barkMat = new THREE.MeshStandardMaterial({vertexColors:true, roughness:1});
   const { geo: puffGeo, mat: puffMat } = getSharedPuff(isConifer);
   const branchGeos = [];
   const puffXforms = [];
@@ -769,12 +778,20 @@ function makeTree(x, z, s, seed, species){
     seg.translate(0, len/2, 0);
     // bend: offset middle vertices perpendicular for organic curve
     const pp = seg.attributes.position;
+    const scol = new Float32Array(pp.count*3);
+    const bkA = new THREE.Color(0x4a3a28), bkB = new THREE.Color(0x6b5638), bkC = new THREE.Color(0x2e2418);
     for(let i=0;i<pp.count;i++){
       const t = pp.getY(i)/len;
       const bendAmt = Math.sin(t*Math.PI) * len * 0.08;
-      pp.setX(i, pp.getX(i) + bendAmt*0.6);
-      pp.setZ(i, pp.getZ(i) + bendAmt*0.35);
+      const bx = pp.getX(i) + bendAmt*0.6, bz = pp.getZ(i) + bendAmt*0.35;
+      pp.setX(i, bx); pp.setZ(i, bz);
+      // bark tint: subtle variation along branch
+      const ang = Math.atan2(bz, bx);
+      const bn = vnoise2(pp.getY(i)*3+seed, ang*2.5);
+      const bc = bkC.clone().lerp(bkA, bn).lerp(bkB, vnoise2(ang*4, pp.getY(i)*6)*0.3);
+      scol[i*3]=bc.r; scol[i*3+1]=bc.g; scol[i*3+2]=bc.b;
     }
+    seg.setAttribute('color', new THREE.BufferAttribute(scol, 3));
     seg.computeVertexNormals();
     // orient along dir
     const q = new THREE.Quaternion().setFromUnitVectors(UP, dir.clone().normalize());
@@ -785,15 +802,29 @@ function makeTree(x, z, s, seed, species){
     const tip = pos.clone().addScaledVector(dir, len);
 
     if(depth <= 0){
-      // leaf tuft at twig tip (small, so branch structure shows through)
-      // conifers: smaller, denser tufts along the branch
-      const r = isConifer ? (0.34+rnd()*0.20)*s : (0.42+rnd()*0.28)*s;
+      // leaf tuft at twig tip — dense, layered
+      const r = isConifer ? (0.34+rnd()*0.20)*s : (0.50+rnd()*0.30)*s;
       puffXforms.push({
         pos: tip.clone().addScaledVector(dir, r*0.35),
         scale: r,
         rotY: rnd()*Math.PI*2,
         squash: isConifer ? 0.85+rnd()*0.15 : 0.72+rnd()*0.2,
       });
+      // broadleaf: extra clusters along the twig for fullness (no more winter look)
+      if(!isConifer){
+        const nExtra = 1+Math.floor(rnd()*2);
+        for(let k=0;k<nExtra;k++){
+          const mid = pos.clone().addScaledVector(dir, len*(0.35+rnd()*0.4));
+          // offset perpendicular for natural spread
+          mid.x += (rnd()-0.5)*0.5*s; mid.z += (rnd()-0.5)*0.5*s;
+          puffXforms.push({
+            pos: mid,
+            scale: r*(0.7+rnd()*0.3),
+            rotY: rnd()*Math.PI*2,
+            squash: 0.72+rnd()*0.2,
+          });
+        }
+      }
       // conifers get extra tufts along the last segment for fullness
       if(isConifer && rnd() < 0.7){
         const mid = pos.clone().addScaledVector(dir, len*0.55);
@@ -840,7 +871,7 @@ function makeTree(x, z, s, seed, species){
     : new THREE.Vector3((rnd()-0.5)*0.24, 1, (rnd()-0.5)*0.24).normalize();
   // start slightly below ground so base is buried
   const trunkLen = isConifer ? 3.4*s : 2.7*s;
-  const trunkRad = isConifer ? 0.22*s : 0.30*s;
+  const trunkRad = isConifer ? 0.28*s : 0.42*s; // thicker, realistic proportion
   const maxDepth = isConifer ? 3 : 3;
   branch(new THREE.Vector3(0,-0.25*s,0), lean, trunkLen, trunkRad, maxDepth);
 
