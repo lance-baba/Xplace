@@ -370,6 +370,7 @@ let grassUniforms;
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uTime:{value:0},
+      uWindDir:{value:new THREE.Vector2(0.8,0.6).normalize()},
       uBottom:{value:new THREE.Color(S.grass.bottom)},
       uTop:{value:new THREE.Color(S.grass.top)},
       uBacklight:{value:new THREE.Color(S.grass.backlight)},
@@ -377,6 +378,7 @@ let grassUniforms;
     },
     vertexShader: `
       uniform float uTime;
+      uniform vec2 uWindDir;
       varying float vH; varying vec3 vWp; varying float vTone;
       void main(){
         vH = uv.y;
@@ -387,15 +389,20 @@ let grassUniforms;
         // idle: gentle breathing, always on — life even with no wind
         float idle = sin(uTime*1.9 + base.x*0.9 + base.z*0.7)*0.5
                    + sin(uTime*2.7 + base.z*1.3 - base.x*0.5)*0.3;
-        // gust: slow traveling wave envelope across the meadow
-        float gp = base.x*0.10 + base.z*0.08 - uTime*0.5;
-        float gust = smoothstep(0.1, 1.0, sin(gp)*0.5+0.5);
-        gust *= 0.55 + 0.45*sin(uTime*0.21 + base.x*0.04 + 1.7);
+        // gust: directional traveling front across the field
+        float gp = dot(base.xz, uWindDir)*0.22 - uTime*1.6;
+        float gust = smoothstep(0.15, 1.0, sin(gp)*0.5+0.5);
+        gust *= 0.55 + 0.45*sin(uTime*0.23 + dot(base.xz, uWindDir)*0.05 + 1.7);
+        // secondary: high-frequency ripple at blade tips (lagging behind base sway)
+        float tip = sin(uTime*7.0 + base.x*2.1 + base.z*1.7 + idle*2.0)*0.5+0.5;
         float m = vH*vH;
-        vec2 sway = vec2(idle*0.045, idle*0.02) + vec2(gust*0.30 + 0.04, gust*0.10);
+        vec2 swayDir = uWindDir;
+        vec2 sway = vec2(idle*0.045, idle*0.02)
+                  + swayDir * (gust*0.34 + 0.05)
+                  + swayDir * tip * 0.05 * (0.3+gust) * vH; // tip flutter
         vec4 wp = modelMatrix * instanceMatrix * vec4(position,1.0);
         wp.xz += sway * m;
-        wp.y -= gust * 0.05 * m;
+        wp.y -= gust * 0.06 * m;
         vWp = wp.xyz;
         gl_Position = projectionMatrix * viewMatrix * wp;
       }`,
@@ -546,38 +553,96 @@ function makePuff(r, squash, seed){
   g.computeVertexNormals();
   return g;
 }
-// shared puff geometry + material for instanced canopies (one draw call per tree)
-const SHARED_PUFF_R = 1.0;
-let sharedPuffGeo = null, sharedFoliageMat = null, sharedPuffDark = null;
+// leaf cluster: individual leaf blades (not blobs) — pointed ellipse, folded vein, outward rosette
+function makeLeafCluster(r, seed){
+  let s = seed >>> 0;
+  const srnd = ()=>{ s = (s*1664525+1013904223)>>>0; return s/4294967296; };
+  const leaves = [];
+  const cols = [];
+  const cA = new THREE.Color(S.leaf[2]), cB = new THREE.Color(S.leaf[0]), cC = new THREE.Color(S.leaf[1]);
+  const nLeaves = 36;
+  for(let i=0;i<nLeaves;i++){
+    // leaf blade: plane tapered to pointed tips, folded along center vein
+    const lw = 0.24*r, ll = 0.68*r;
+    const leaf = new THREE.PlaneGeometry(lw, ll, 1, 4);
+    const lp = leaf.attributes.position;
+    const lcol = new Float32Array(lp.count*3);
+    // per-leaf tint
+    const tint = cA.clone().lerp(cB, srnd()).lerp(cC, srnd()*0.5);
+    for(let j=0;j<lp.count;j++){
+      const x = lp.getX(j), y = lp.getY(j);
+      const t = y/ll + 0.5; // 0=base .. 1=tip
+      // pointed ends: narrow at base and tip
+      const w = Math.sin(Math.pow(t, 0.8) * Math.PI);
+      const nx = x * Math.max(w, 0.02);
+      // fold: V cross-section along vein
+      const fold = Math.abs(nx) * 0.55;
+      // curl: tip bends back slightly
+      const curl = Math.sin(t*Math.PI) * 0.06*r + t*t*0.10*r;
+      lp.setX(j, nx);
+      lp.setZ(j, fold + curl);
+      lcol[j*3]=tint.r; lcol[j*3+1]=tint.g; lcol[j*3+2]=tint.b;
+    }
+    leaf.setAttribute('color', new THREE.BufferAttribute(lcol, 3));
+    leaf.computeVertexNormals();
+    // arrange: fibonacci sphere, leaf base near center, tip outward
+    const ga = Math.PI * (3 - Math.sqrt(5));
+    const yy = 1 - (i/(nLeaves-1))*2;
+    const rad = Math.sqrt(1-yy*yy);
+    const th = ga*i;
+    const dir = new THREE.Vector3(Math.cos(th)*rad, yy*0.85, Math.sin(th)*rad).normalize();
+    // orient leaf: +Y (length) along dir, base at cluster center
+    const up = new THREE.Vector3(0,1,0);
+    const q = new THREE.Quaternion().setFromUnitVectors(up, dir);
+    // random roll around dir for natural variation
+    const roll = new THREE.Quaternion().setFromAxisAngle(dir, srnd()*Math.PI*2);
+    q.premultiply(roll);
+    leaf.applyQuaternion(q);
+    // base sits slightly inside, tip reaches r
+    leaf.translate(dir.x*r*0.25, dir.y*r*0.25, dir.z*r*0.25);
+    leaves.push(leaf);
+  }
+  const merged = mergeGeometries(leaves, false);
+  leaves.forEach(l=>l.dispose());
+  return merged;
+}
+// shared leaf-cluster geometry + material (one draw call per tree)
+const SHARED_LEAF_R = 1.0;
+let sharedLeafGeo = null, sharedFoliageMat = null, sharedPuffDark = null;
 function getSharedPuff(dark){
-  if(!sharedPuffGeo){
-    sharedPuffGeo = makePuff(SHARED_PUFF_R, 0.78, 7.7);
-    sharedFoliageMat = makeFoliageMat(SHARED_PUFF_R);
+  if(!sharedLeafGeo){
+    sharedLeafGeo = makeLeafCluster(SHARED_LEAF_R, 777);
+    sharedFoliageMat = makeFoliageMat(SHARED_LEAF_R);
     // darker variant for conifers: tint via material color
-    sharedPuffDark = makeFoliageMat(SHARED_PUFF_R);
+    sharedPuffDark = makeFoliageMat(SHARED_LEAF_R);
     sharedPuffDark.color.set('#9fb890'); // multiplies vertex colors -> deeper green
   }
-  return { geo: sharedPuffGeo, mat: dark ? sharedPuffDark : sharedFoliageMat };
+  return { geo: sharedLeafGeo, mat: dark ? sharedPuffDark : sharedFoliageMat };
 }
-// foliage material: standard lighting + idle flutter (moves even without wind)
+// foliage material: standard lighting + leaf-tip flutter (moves even without wind)
 function makeFoliageMat(puffR){
-  const m = new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0, vertexColors: true });
+  const m = new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0, vertexColors: true, side: THREE.DoubleSide });
   m.onBeforeCompile = (sh) => {
     sh.uniforms.uTime = foliageUniforms.uTime;
-    sh.vertexShader = ('uniform float uTime;\n#define PUFF_R ' + puffR.toFixed(3) + '\n') +
+    sh.vertexShader = ('uniform float uTime;\n') +
       sh.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
       {
         vec4 fwp = modelMatrix * vec4(transformed, 1.0);
         float ph = fwp.x*1.9 + fwp.z*2.4 + fwp.y*1.3;
         float fl = sin(uTime*2.3 + ph)*0.6 + sin(uTime*3.9 + ph*1.7)*0.4;
-        float fmask = smoothstep(0.15, 0.9, length(position) / PUFF_R);
-        transformed += objectNormal * fl * 0.055 * fmask;
-        transformed.x += fl * 0.035 * fmask;
+        // leaf tips (uv.y=1) flutter most; base stays attached
+        #ifdef USE_UV
+          float tipMask = uv.y;
+        #else
+          float tipMask = 0.5;
+        #endif
+        transformed += objectNormal * fl * 0.06 * tipMask;
+        transformed.x += fl * 0.04 * tipMask;
+        transformed.z += cos(uTime*1.7 + ph*1.3) * 0.03 * tipMask;
       }`);
   };
   return m;
 }
-
 
 /* ---------------- bushes: low leaf-puff clusters ---------------- */
 function makeBush(x, z, s, seed){
@@ -585,14 +650,61 @@ function makeBush(x, z, s, seed){
   const n = 4 + Math.floor(rnd()*2);
   for(let i=0;i<n;i++){
     const r = (0.45 + rnd()*0.35) * s;
-    const puff = new THREE.Mesh(makePuff(r, 0.72, seed + i*3.7), makeFoliageMat(r));
+    const cluster = new THREE.Mesh(makeLeafCluster(r, seed + i*3.7), makeFoliageMat(r));
     const a = (i/n)*Math.PI*2 + rnd()*0.8;
     const rr = rnd()*0.55*s;
-    puff.position.set(Math.cos(a)*rr, (0.28+rnd()*0.25)*s, Math.sin(a)*rr);
-    g.add(puff);
+    cluster.position.set(Math.cos(a)*rr, (0.28+rnd()*0.25)*s, Math.sin(a)*rr);
+    g.add(cluster);
   }
   g.position.set(x, terrainH(x,z), z);
   scene.add(g); treeCrowns.push(g);
+}
+
+/* ---------------- ferns: crossed arching fronds, instanced ---------------- */
+const FERN_N = 400;
+{
+  // one frond: tapered plane bent in an arc
+  const frond = new THREE.PlaneGeometry(0.16, 0.7, 1, 6);
+  const fp = frond.attributes.position;
+  for(let i=0;i<fp.count;i++){
+    const y = fp.getY(i) + 0.35; // 0..0.7
+    const t = y / 0.7;
+    fp.setX(i, fp.getX(i) * (1-t*0.85));      // taper to tip
+    fp.setZ(i, t*t*0.45);                       // arc outward
+    fp.setY(i, y*(1-t*0.35));                   // droop
+  }
+  frond.computeVertexNormals();
+  // 7 fronds in a rosette
+  const parts = [];
+  for(let i=0;i<7;i++){
+    const fg = frond.clone();
+    fg.applyMatrix4(new THREE.Matrix4().makeRotationY(i/7*Math.PI*2 + 0.3));
+    parts.push(fg);
+  }
+  const fernGeo = mergeGeometries(parts, false);
+  parts.forEach(p=>p.dispose()); frond.dispose();
+  const fernMat = new THREE.MeshStandardMaterial({
+    color: 0x4a7a2e, roughness: 0.9, side: THREE.DoubleSide,
+    emissive: 0x1a2f0e, emissiveIntensity: 0.35,
+  });
+  const ferns = new THREE.InstancedMesh(fernGeo, fernMat, FERN_N);
+  const m=new THREE.Matrix4(), q=new THREE.Quaternion(), e=new THREE.Euler(),
+        pv=new THREE.Vector3(), sv=new THREE.Vector3();
+  let fseed = 31337;
+  const frnd = ()=>{ fseed = (fseed*1664525+1013904223)>>>0; return fseed/4294967296; };
+  for(let i=0;i<FERN_N;i++){
+    // cluster under/near trees: ring r 8-24
+    const a = frnd()*Math.PI*2, r = 8 + frnd()*16;
+    const x = Math.cos(a)*r, z = Math.sin(a)*r;
+    const th = terrainH(x,z);
+    if(th < WATER_Y + 0.1){ m.makeScale(0,0,0); m.setPosition(x,-10,z); ferns.setMatrixAt(i,m); continue; }
+    e.set(0, frnd()*Math.PI*2, 0); q.setFromEuler(e);
+    const s = 0.7 + frnd()*0.9;
+    pv.set(x, th-0.02, z); sv.set(s, s*(0.8+frnd()*0.4), s);
+    m.compose(pv,q,sv); ferns.setMatrixAt(i,m);
+  }
+  ferns.instanceMatrix.needsUpdate = true;
+  scene.add(ferns);
 }
 
 /* ---------------- tree: bent trunk + branches + leaf puffs ---------------- */
@@ -677,8 +789,8 @@ function makeTree(x, z, s, seed, species){
     // fork into children
     let nChild, tiltBase, tiltVar, lenRatio;
     if(isConifer){
-      // whorled: ring of near-horizontal branches
-      nChild = 4+Math.floor(rnd()*3);
+      // whorled: ring of near-horizontal branches (kept shallow to avoid explosion)
+      nChild = 3+Math.floor(rnd()*2);
       tiltBase = 1.05; tiltVar = 0.25; lenRatio = 0.58;
     } else {
       nChild = depth >= 3 ? 3+Math.floor(rnd()*2) : 2+Math.floor(rnd()*2);
@@ -709,7 +821,7 @@ function makeTree(x, z, s, seed, species){
   // start slightly below ground so base is buried
   const trunkLen = isConifer ? 3.4*s : 2.7*s;
   const trunkRad = isConifer ? 0.22*s : 0.30*s;
-  const maxDepth = isConifer ? 4 : 3;
+  const maxDepth = isConifer ? 3 : 3;
   branch(new THREE.Vector3(0,-0.25*s,0), lean, trunkLen, trunkRad, maxDepth);
 
   // merge all branch segments into one mesh (1 draw call)
@@ -734,9 +846,33 @@ function makeTree(x, z, s, seed, species){
   scene.add(g);
   treeCrowns.push(g); // whole-tree sway; leaf flutter is in-shader
 }
-makeTree(4.5, -3.5, 1.25, 101, 0); makeTree(-5.5, 2.0, 1.0, 202, 0); makeTree(1.5, -7.5, 0.85, 303, 1);
-makeTree(-9, 7, 1.1, 404, 0); makeTree(9.5, -8, 0.9, 505, 1); makeTree(-13, -6, 1.0, 606, 1);
-makeTree(8.5, 1.0, 1.0, 707, 1); // conifer in default view
+// FOREST layout: central clearing (r<7) + dense forest ring (r 8-26)
+// Poisson-ish: jittered grid, skip clearing/pond/paths
+{
+  let seed = 9001;
+  const frnd = ()=>{ seed = (seed*1664525+1013904223)>>>0; return seed/4294967296; };
+  const FOREST_R = 26;
+  const step = 3.8;
+  let ti = 0;
+  for(let gx=-FOREST_R; gx<=FOREST_R; gx+=step){
+    for(let gz=-FOREST_R; gz<=FOREST_R; gz+=step){
+      const jx = gx + (frnd()-0.5)*2.4, jz = gz + (frnd()-0.5)*2.4;
+      const r = Math.hypot(jx, jz);
+      if(r < 7.5) continue;              // clearing
+      if(r > FOREST_R) continue;
+      if(frnd() < 0.22) continue;        // natural gaps
+      const th = terrainH(jx, jz);
+      if(th < WATER_Y + 0.25) continue;  // not in pond
+      const species = frnd() < 0.62 ? 0 : 1; // 62% broadleaf, 38% conifer
+      const s = 0.85 + frnd()*0.65;
+      makeTree(jx, jz, s, 7000+ti*13, species);
+      ti++;
+    }
+  }
+  console.log('forest trees:', ti);
+}
+// a few hero trees near the clearing edge for close inspection
+makeTree(4.5, -3.5, 1.25, 101, 0); makeTree(-5.5, 2.0, 1.0, 202, 0); makeTree(-9, 7, 1.1, 404, 0);
 
 /* ---------------- fireflies (night) ---------------- */
 let flyGeo=null, flySeed=[];
