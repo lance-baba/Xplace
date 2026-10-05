@@ -60,7 +60,7 @@ const STYLES = {
     sky: { zenith:'#2e6ab5', horizon:'#d4ecf4', sun:'#fff3d2' },
     cloud: { cover: 0.42, color:'#ffffff' },
     water: { deep:'#14617f', shallow:'#62c2ae', sky:'#bfe3f2' },
-    skyPhoto: '../assets-sky-base.jpg', skyExposure: 1.0,
+    skyPhoto: null, skyExposure: 1.0,
   },
   night: {
     fog: [0x0a1024, 0.010],
@@ -196,21 +196,25 @@ function trockField(x, z) {
   }
   return [h, mask > 1 ? 1 : mask];
 }
+const COAST_X = -6; // coastline: meadow east (x>COAST_X), ocean west
 function terrainH(x,z){
-  const d = Math.hypot(x-POND.x, z-POND.z);
-  // rolling hills, two octaves
+  // rolling hills, two octaves (meadow side)
   let h = 1.7 * vnoise2(x*0.075+3.1, z*0.075-1.7) + 0.55 * vnoise2(x*0.23-5.2, z*0.23+2.8);
   h = (h - 1.12) * 2.0;
-  h *= 0.25 + 0.75*sstep(2.0, 7.0, d);          // flatten near pond
-  h -= 1.3 * (1 - sstep(3.0, 5.5, d));        // basin
   h += trockField(x, z)[0];                   // rock outcrops
+  // coastal falloff: slope down to seabed west of coastline
+  const coastT = sstep(COAST_X+2, COAST_X-18, x); // 0=land, 1=sea
+  const seabed = -3.5 + vnoise2(x*0.05, z*0.05)*1.2; // seabed below water
+  h = h*(1-coastT) + seabed*coastT;
+  // beach: smooth sand strip near waterline
   return h;
 }
 let terrainUniforms = null;
 {
-  // RingGeometry: interior vertices for displacement; larger for real hills
-  const g = new THREE.RingGeometry(0.01, 30, 128, 48);
+  // RingGeometry: interior vertices for displacement; covers meadow + coast
+  const g = new THREE.RingGeometry(0.01, 55, 96, 32);
   g.rotateX(-Math.PI/2);
+  // no translate: keep centered at origin, terrainH handles coast
   const p = g.attributes.position;
   const rockAttr = new Float32Array(p.count);
   for(let i=0;i<p.count;i++){
@@ -291,11 +295,13 @@ let terrainUniforms = null;
   scene.add(new THREE.Mesh(g, m));
 }
 
-/* ---------------- pond water (lightweight stylized) ---------------- */
+/* ---------------- ocean: large, west of coastline ---------------- */
 let waterUniforms;
 {
-  const wg = new THREE.CircleGeometry(POND.r, 48);
+  // 120x80 plane, positioned to cover x < COAST_X+5
+  const wg = new THREE.PlaneGeometry(120, 80, 60, 40);
   wg.rotateX(-Math.PI/2);
+  wg.translate(COAST_X - 55, 0, 0); // extends from x=COAST_X+5 to x=COAST_X-115
   waterUniforms = {
     uTime:{value:0},
     uDeep:{value:new THREE.Color(S.water.deep)},
@@ -303,19 +309,21 @@ let waterUniforms;
     uSkyCol:{value:new THREE.Color(S.water.sky)},
     uSunDir:{value:sunDir},
     uSunColor:{value:new THREE.Color(S.sky.sun)},
+    uCoastX:{value:COAST_X},
   };
   const wm = new THREE.ShaderMaterial({
     uniforms: waterUniforms,
     transparent: true,
     vertexShader: `
       uniform float uTime;
-      varying vec3 vWp; varying vec2 vC;
+      varying vec3 vWp;
+      // ocean waves: larger swells + chop
       float waveH(vec2 p){
-        return sin(p.x*1.4+uTime*1.3)*0.045 + sin(p.y*1.8-uTime*0.9)*0.04
-             + sin((p.x+p.y)*2.6+uTime*1.8)*0.025
-             + sin(p.x*7.0+uTime*3.0)*sin(p.y*6.0-uTime*2.2)*0.012; }
+        return sin(p.x*0.25+uTime*0.9)*0.28 + sin(p.y*0.31-uTime*0.7)*0.22
+             + sin((p.x+p.y)*0.55+uTime*1.2)*0.12
+             + sin(p.x*1.4+uTime*1.8)*sin(p.y*1.2-uTime*1.4)*0.08
+             + sin(p.x*3.5+uTime*2.5)*0.03; }
       void main(){
-        vC = uv - 0.5;
         vec3 tp = position; tp.y += waveH(position.xz);
         vec4 wp = modelMatrix * vec4(tp, 1.0);
         vWp = wp.xyz;
@@ -324,39 +332,56 @@ let waterUniforms;
     fragmentShader: `
       uniform float uTime;
       uniform vec3 uDeep, uShallow, uSkyCol, uSunDir, uSunColor;
-      varying vec3 vWp; varying vec2 vC;
+      uniform float uCoastX;
+      varying vec3 vWp;
       float waveH(vec2 p){
-        return sin(p.x*1.4+uTime*1.3)*0.045 + sin(p.y*1.8-uTime*0.9)*0.04
-             + sin((p.x+p.y)*2.6+uTime*1.8)*0.025
-             + sin(p.x*7.0+uTime*3.0)*sin(p.y*6.0-uTime*2.2)*0.012; }
+        return sin(p.x*0.25+uTime*0.9)*0.28 + sin(p.y*0.31-uTime*0.7)*0.22
+             + sin((p.x+p.y)*0.55+uTime*1.2)*0.12
+             + sin(p.x*1.4+uTime*1.8)*sin(p.y*1.2-uTime*1.4)*0.08
+             + sin(p.x*3.5+uTime*2.5)*0.03; }
       void main(){
-        vec2 p = vWp.xz; float e = 0.12;
+        vec2 p = vWp.xz; float e = 0.35;
         float hC = waveH(p);
         float hX = waveH(p+vec2(e,0.)) - hC;
         float hZ = waveH(p+vec2(0.,e)) - hC;
         vec3 n = normalize(vec3(-hX/e, 1.0, -hZ/e));
-        float r = length(vC)*2.0;
-        float depth = smoothstep(1.0, 0.25, r);
-        vec3 col = mix(uShallow, uDeep, depth);
+        // depth: shallow near coast, deep offshore
+        float shoreDist = clamp((uCoastX - p.x) / 40.0, 0.0, 1.0);
+        vec3 col = mix(uShallow, uDeep, smoothstep(0.0, 0.55, shoreDist));
         vec3 V = normalize(cameraPosition - vWp);
         float fres = pow(1.0 - max(dot(V, n), 0.0), 3.0);
-        col = mix(col, uSkyCol, fres*0.6);
+        col = mix(col, uSkyCol, fres*0.65);
+        // sun glitter: sparkling highlights
         vec3 H = normalize(V + normalize(uSunDir));
-        col += uSunColor * pow(max(dot(n, H), 0.0), 120.0) * 1.2;
-        float foam = smoothstep(0.90, 0.995, r + 0.03*sin(uTime*1.6 + atan(vC.y, vC.x)*7.0));
-        col = mix(col, vec3(0.93, 0.97, 0.95), foam*0.5);
-        gl_FragColor = vec4(col, 0.94);
+        float spec = pow(max(dot(n, H), 0.0), 240.0);
+        // sparkle: high-freq noise modulates glitter
+        float sp = fract(sin(dot(floor(p*8.0), vec2(12.9898,78.233)))*43758.5453);
+        col += uSunColor * spec * (1.5 + sp*2.0);
+        // shore foam: animated edge
+        float foamBand = smoothstep(0.06, 0.0, shoreDist);
+        float foamN = sin(uTime*1.8 + p.x*0.8 + p.y*0.5)*0.5+0.5;
+        foamN *= sin(uTime*2.3 - p.x*1.2 + p.y*0.8)*0.5+0.5;
+        float foam = foamBand * smoothstep(0.35, 0.75, foamN);
+        col = mix(col, vec3(0.94, 0.97, 0.96), foam*0.75);
+        // distance fade to horizon
+        float dist = length(cameraPosition.xz - p);
+        col = mix(col, uSkyCol*0.9, smoothstep(120.0, 280.0, dist)*0.5);
+        gl_FragColor = vec4(col, 0.96);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
       }`,
+    side: THREE.DoubleSide,
   });
   const water = new THREE.Mesh(wg, wm);
-  water.position.set(POND.x, WATER_Y, POND.z);
+  water.position.y = WATER_Y;
+  water.renderOrder = 2;
   scene.add(water);
 }
 
+/* ---------------- grass: instanced blades ---------------- */
+
 /* ---------------- grass: instanced blades + idle/gust wind ---------------- */
-const GRASS_N = 18000, GRASS_R = 18;
+const GRASS_N = 18000, GRASS_R = 18, GRASS_CX = 14; // meadow center east
 let grassUniforms;
 {
   const bg = new THREE.PlaneGeometry(0.14, 1.0, 1, 4);
@@ -434,7 +459,7 @@ let grassUniforms;
         pv=new THREE.Vector3(), sv=new THREE.Vector3();
   for(let i=0;i<GRASS_N;i++){
     const r = Math.sqrt(rnd())*GRASS_R, a = rnd()*Math.PI*2;
-    const x = Math.cos(a)*r, z = Math.sin(a)*r;
+    const x = GRASS_CX + Math.cos(a)*r, z = Math.sin(a)*r;
     const th = terrainH(x,z);
     if(th < WATER_Y + 0.06){ m.makeScale(0,0,0); m.setPosition(x,-10,z); inst.setMatrixAt(i,m); continue; }
     e.set((rnd()-0.5)*0.25, rnd()*Math.PI*2, (rnd()-0.5)*0.25); q.setFromEuler(e);
@@ -509,7 +534,7 @@ function makeFlowerHead(){
         pv=new THREE.Vector3(), sv=new THREE.Vector3();
   for(let i=0;i<FLOWER_N;i++){
     const r = 2.5+Math.sqrt(rnd())*11.5, a=rnd()*Math.PI*2;
-    const x=Math.cos(a)*r, z=Math.sin(a)*r;
+    const x=14+Math.cos(a)*r, z=Math.sin(a)*r;
     const th = terrainH(x,z);
     if(th < WATER_Y + 0.06){
       m.makeScale(0,0,0); m.setPosition(x,-10,z);
@@ -560,7 +585,7 @@ function makeLeafCluster(r, seed){
   const leaves = [];
   const cols = [];
   const cA = new THREE.Color(S.leaf[2]), cB = new THREE.Color(S.leaf[0]), cC = new THREE.Color(S.leaf[1]);
-  const nLeaves = 36;
+  const nLeaves = 55;
   for(let i=0;i<nLeaves;i++){
     // leaf blade: plane tapered to pointed tips, folded along center vein
     const lw = 0.24*r, ll = 0.68*r;
@@ -571,7 +596,7 @@ function makeLeafCluster(r, seed){
     const tint = cA.clone().lerp(cB, srnd()).lerp(cC, srnd()*0.5);
     for(let j=0;j<lp.count;j++){
       const x = lp.getX(j), y = lp.getY(j);
-      const t = y/ll + 0.5; // 0=base .. 1=tip
+      const t = THREE.MathUtils.clamp(y/ll + 0.5, 0, 1); // 0=base .. 1=tip
       // pointed ends: narrow at base and tip
       const w = Math.sin(Math.pow(t, 0.8) * Math.PI);
       const nx = x * Math.max(w, 0.02);
@@ -592,6 +617,8 @@ function makeLeafCluster(r, seed){
     const th = ga*i;
     const dir = new THREE.Vector3(Math.cos(th)*rad, yy*0.85, Math.sin(th)*rad).normalize();
     // orient leaf: +Y (length) along dir, base at cluster center
+    // avoid exact opposite (south pole) which makes setFromUnitVectors produce NaN
+    if(dir.y < -0.999) dir.x += 0.001, dir.normalize();
     const up = new THREE.Vector3(0,1,0);
     const q = new THREE.Quaternion().setFromUnitVectors(up, dir);
     // random roll around dir for natural variation
@@ -693,9 +720,9 @@ const FERN_N = 400;
   let fseed = 31337;
   const frnd = ()=>{ fseed = (fseed*1664525+1013904223)>>>0; return fseed/4294967296; };
   for(let i=0;i<FERN_N;i++){
-    // cluster under/near trees: ring r 8-24
-    const a = frnd()*Math.PI*2, r = 8 + frnd()*16;
-    const x = Math.cos(a)*r, z = Math.sin(a)*r;
+    // cluster under/near trees: ring around forest center (14,0)
+    const a = frnd()*Math.PI*2, r = 8 + frnd()*14;
+    const x = 14 + Math.cos(a)*r, z = Math.sin(a)*r;
     const th = terrainH(x,z);
     if(th < WATER_Y + 0.1){ m.makeScale(0,0,0); m.setPosition(x,-10,z); ferns.setMatrixAt(i,m); continue; }
     e.set(0, frnd()*Math.PI*2, 0); q.setFromEuler(e);
@@ -709,25 +736,34 @@ const FERN_N = 400;
 
 /* ---------------- tree: bent trunk + branches + leaf puffs ---------------- */
 function makeTrunk(h, r0, r1, seed){
-  const g = new THREE.CylinderGeometry(r1, r0, h, 8, 6);
+  const g = new THREE.CylinderGeometry(r1, r0, h, 12, 8);
   g.translate(0, h/2, 0);
   const p = g.attributes.position;
+  const cols = new Float32Array(p.count*3);
+  const barkA = new THREE.Color(0x4a3a28), barkB = new THREE.Color(0x6b5638), barkC = new THREE.Color(0x2e2418);
   const v = new THREE.Vector3();
   const bendA = (rnd()-0.5)*0.5, bendP = rnd()*Math.PI*2;
   for(let i=0;i<p.count;i++){
     v.set(p.getX(i), p.getY(i), p.getZ(i));
     const t = v.y / h;
-    // gentle bend + root flare + bark lumps
+    const ang = Math.atan2(v.z, v.x);
+    // gentle bend + root flare
     v.x += Math.sin(t*2.2+bendP)*bendA*t*h*0.35;
     v.z += Math.cos(t*1.7+bendP)*bendA*t*h*0.25;
-    const flare = 1 + (1-t)*(1-t)*0.9;
+    const flare = 1 + (1-t)*(1-t)*1.2;
     v.x *= flare; v.z *= flare;
-    const b = 1 + (vnoise2(v.y*4+seed, Math.atan2(v.z,v.x)*2)-0.5)*0.28;
+    // bark: vertical ridges (grooves) + lumps
+    const ridge = vnoise2(ang*3.0+seed, v.y*1.5)*0.5 + vnoise2(ang*7.0-seed, v.y*4.0)*0.3;
+    const b = 1 + (ridge-0.4)*0.22 + (vnoise2(v.y*4+seed, ang*2)-0.5)*0.12;
     v.x *= b; v.z *= b;
     p.setXYZ(i, v.x, v.y, v.z);
+    // bark color: darker in grooves, lighter on ridges
+    const cc = barkC.clone().lerp(barkA, THREE.MathUtils.clamp(ridge*1.4,0,1)).lerp(barkB, vnoise2(v.y*2+seed*2, ang*1.5)*0.35);
+    cols[i*3]=cc.r; cols[i*3+1]=cc.g; cols[i*3+2]=cc.b;
   }
+  g.setAttribute('color', new THREE.BufferAttribute(cols, 3));
   g.computeVertexNormals();
-  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({color:S.trunk, roughness:1}));
+  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({vertexColors:true, roughness:1}));
   m.userData.topY = h;
   return m;
 }
@@ -735,7 +771,7 @@ function makeTree(x, z, s, seed, species){
   species = species || 0; // 0=broadleaf, 1=conifer
   const isConifer = species === 1;
   const g = new THREE.Group();
-  const barkMat = new THREE.MeshStandardMaterial({color:S.trunk, roughness:1});
+  const barkMat = new THREE.MeshStandardMaterial({vertexColors:true, roughness:1});
   const { geo: puffGeo, mat: puffMat } = getSharedPuff(isConifer);
   const branchGeos = [];
   const puffXforms = [];
@@ -749,12 +785,20 @@ function makeTree(x, z, s, seed, species){
     seg.translate(0, len/2, 0);
     // bend: offset middle vertices perpendicular for organic curve
     const pp = seg.attributes.position;
+    const scol = new Float32Array(pp.count*3);
+    const bkA = new THREE.Color(0x4a3a28), bkB = new THREE.Color(0x6b5638), bkC = new THREE.Color(0x2e2418);
     for(let i=0;i<pp.count;i++){
       const t = pp.getY(i)/len;
       const bendAmt = Math.sin(t*Math.PI) * len * 0.08;
-      pp.setX(i, pp.getX(i) + bendAmt*0.6);
-      pp.setZ(i, pp.getZ(i) + bendAmt*0.35);
+      const bx = pp.getX(i) + bendAmt*0.6, bz = pp.getZ(i) + bendAmt*0.35;
+      pp.setX(i, bx); pp.setZ(i, bz);
+      // bark tint: subtle variation along branch
+      const ang = Math.atan2(bz, bx);
+      const bn = vnoise2(pp.getY(i)*3+seed, ang*2.5);
+      const bc = bkC.clone().lerp(bkA, bn).lerp(bkB, vnoise2(ang*4, pp.getY(i)*6)*0.3);
+      scol[i*3]=bc.r; scol[i*3+1]=bc.g; scol[i*3+2]=bc.b;
     }
+    seg.setAttribute('color', new THREE.BufferAttribute(scol, 3));
     seg.computeVertexNormals();
     // orient along dir
     const q = new THREE.Quaternion().setFromUnitVectors(UP, dir.clone().normalize());
@@ -765,15 +809,29 @@ function makeTree(x, z, s, seed, species){
     const tip = pos.clone().addScaledVector(dir, len);
 
     if(depth <= 0){
-      // leaf tuft at twig tip (small, so branch structure shows through)
-      // conifers: smaller, denser tufts along the branch
-      const r = isConifer ? (0.34+rnd()*0.20)*s : (0.42+rnd()*0.28)*s;
+      // leaf tuft at twig tip — dense, layered
+      const r = isConifer ? (0.34+rnd()*0.20)*s : (0.50+rnd()*0.30)*s;
       puffXforms.push({
         pos: tip.clone().addScaledVector(dir, r*0.35),
         scale: r,
         rotY: rnd()*Math.PI*2,
         squash: isConifer ? 0.85+rnd()*0.15 : 0.72+rnd()*0.2,
       });
+      // broadleaf: extra clusters along the twig for fullness (no more winter look)
+      if(!isConifer){
+        const nExtra = 1+Math.floor(rnd()*2);
+        for(let k=0;k<nExtra;k++){
+          const mid = pos.clone().addScaledVector(dir, len*(0.35+rnd()*0.4));
+          // offset perpendicular for natural spread
+          mid.x += (rnd()-0.5)*0.5*s; mid.z += (rnd()-0.5)*0.5*s;
+          puffXforms.push({
+            pos: mid,
+            scale: r*(0.7+rnd()*0.3),
+            rotY: rnd()*Math.PI*2,
+            squash: 0.72+rnd()*0.2,
+          });
+        }
+      }
       // conifers get extra tufts along the last segment for fullness
       if(isConifer && rnd() < 0.7){
         const mid = pos.clone().addScaledVector(dir, len*0.55);
@@ -820,7 +878,7 @@ function makeTree(x, z, s, seed, species){
     : new THREE.Vector3((rnd()-0.5)*0.24, 1, (rnd()-0.5)*0.24).normalize();
   // start slightly below ground so base is buried
   const trunkLen = isConifer ? 3.4*s : 2.7*s;
-  const trunkRad = isConifer ? 0.22*s : 0.30*s;
+  const trunkRad = isConifer ? 0.28*s : 0.42*s; // thicker, realistic proportion
   const maxDepth = isConifer ? 3 : 3;
   branch(new THREE.Vector3(0,-0.25*s,0), lean, trunkLen, trunkRad, maxDepth);
 
@@ -847,22 +905,22 @@ function makeTree(x, z, s, seed, species){
   treeCrowns.push(g); // whole-tree sway; leaf flutter is in-shader
 }
 // FOREST layout: central clearing (r<7) + dense forest ring (r 8-26)
-// Poisson-ish: jittered grid, skip clearing/pond/paths
+// Poisson-ish: jittered grid, skip clearing/paths; meadow shifted east (forest center at x=14)
 {
   let seed = 9001;
   const frnd = ()=>{ seed = (seed*1664525+1013904223)>>>0; return seed/4294967296; };
-  const FOREST_R = 26;
+  const FOREST_R = 22, FCX = 14, FCZ = 0; // forest center
   const step = 3.8;
   let ti = 0;
   for(let gx=-FOREST_R; gx<=FOREST_R; gx+=step){
     for(let gz=-FOREST_R; gz<=FOREST_R; gz+=step){
-      const jx = gx + (frnd()-0.5)*2.4, jz = gz + (frnd()-0.5)*2.4;
-      const r = Math.hypot(jx, jz);
+      const jx = FCX + gx + (frnd()-0.5)*2.4, jz = FCZ + gz + (frnd()-0.5)*2.4;
+      const r = Math.hypot(gx, gz);
       if(r < 7.5) continue;              // clearing
       if(r > FOREST_R) continue;
       if(frnd() < 0.22) continue;        // natural gaps
       const th = terrainH(jx, jz);
-      if(th < WATER_Y + 0.25) continue;  // not in pond
+      if(th < WATER_Y + 0.25) continue;  // not in water
       const species = frnd() < 0.62 ? 0 : 1; // 62% broadleaf, 38% conifer
       const s = 0.85 + frnd()*0.65;
       makeTree(jx, jz, s, 7000+ti*13, species);
@@ -872,8 +930,8 @@ function makeTree(x, z, s, seed, species){
   console.log('forest trees:', ti);
 }
 // a few hero trees near the clearing edge for close inspection
-makeTree(4.5, -3.5, 1.25, 101, 0); makeTree(-5.5, 2.0, 1.0, 202, 0); makeTree(-9, 7, 1.1, 404, 0);
-makeTree(8.5, 1.0, 1.1, 707, 1); // hero conifer: right side of default view
+makeTree(18.5, -3.5, 1.25, 101, 0); makeTree(8.5, 2.0, 1.0, 202, 0); makeTree(5, 7, 1.1, 404, 0);
+makeTree(22.5, 1.0, 1.1, 707, 1); // hero conifer: right side of default view
 
 /* ---------------- fireflies (night) ---------------- */
 let flyGeo=null, flySeed=[];
@@ -889,12 +947,12 @@ if(S.fireflies){
 }
 
 /* ---------------- camera: game vs cinema ---------------- */
-const camera = new THREE.PerspectiveCamera(42, W/H, 0.1, 200);
+const camera = new THREE.PerspectiveCamera(42, W/H, 0.1, 600);
 let controls=null;
 if(gameMode){
-  camera.position.set(11.5, 6.8, 15.5);
+  camera.position.set(45, 14, 35);
   controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(1.5, 1.0, 1.0); controls.update();
+  controls.target.set(-5, 0, 0); controls.update();
   document.getElementById('hint').textContent = `game mode · style=${styleName} · drag to orbit`;
 }else{
   document.getElementById('hint').textContent = '';
@@ -936,6 +994,7 @@ window.renderFrame=function(t){
 window.renderFrame(0);
 window.sceneReady = true;
 window.__camera = camera; window.__controls = controls; window.__scene = scene;
+window.__treeCrowns = treeCrowns;
 window.__POND = POND; window.__terrainH = terrainH; window.__WATER_Y = WATER_Y;
 if(gameMode){ // live browser program: self-driven clock
   const clock = new THREE.Clock();
