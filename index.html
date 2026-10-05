@@ -21,6 +21,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 /* ============================================================
    SCENE ENGINE v0.1 — core + style presets + dual output
@@ -515,6 +516,16 @@ function makePuff(r, squash, seed){
   g.computeVertexNormals();
   return g;
 }
+// shared puff geometry + material for instanced canopies (one draw call per tree)
+const SHARED_PUFF_R = 1.0;
+let sharedPuffGeo = null, sharedFoliageMat = null;
+function getSharedPuff(){
+  if(!sharedPuffGeo){
+    sharedPuffGeo = makePuff(SHARED_PUFF_R, 0.78, 7.7);
+    sharedFoliageMat = makeFoliageMat(SHARED_PUFF_R);
+  }
+  return { geo: sharedPuffGeo, mat: sharedFoliageMat };
+}
 // foliage material: standard lighting + idle flutter (moves even without wind)
 function makeFoliageMat(puffR){
   const m = new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0, vertexColors: true });
@@ -577,44 +588,93 @@ function makeTrunk(h, r0, r1, seed){
 }
 function makeTree(x, z, s, seed){
   const g = new THREE.Group();
-  const trunkH = 2.6*s;
-  const trunk = makeTrunk(trunkH, 0.30*s, 0.15*s, seed);
-  g.add(trunk);
-  const crown = new THREE.Group();
-  // branches (visible structure)
-  const nb = 4 + Math.floor(rnd()*2);
-  for(let i=0;i<nb;i++){
-    const a = (i/nb)*Math.PI*2 + rnd()*0.9;
-    const len = (1.1+rnd()*0.7)*s;
-    const tilt = 0.5+rnd()*0.45;
-    const bx = Math.cos(a), bz = Math.sin(a);
-    const bg = new THREE.CylinderGeometry(0.05*s, 0.09*s, len, 6);
-    bg.translate(0, len/2, 0);
-    const br = new THREE.Mesh(bg, trunk.material);
-    br.position.set(bx*0.1*s, trunkH*0.82, bz*0.1*s);
-    br.rotation.set(bz*tilt, 0, -bx*tilt);
-    crown.add(br);
+  const barkMat = new THREE.MeshStandardMaterial({color:S.trunk, roughness:1});
+  const { geo: puffGeo, mat: puffMat } = getSharedPuff();
+  const branchGeos = [];
+  const puffXforms = []; // {pos, scale, rotY}
+  const UP = new THREE.Vector3(0,1,0);
+  const tmpV = new THREE.Vector3();
+
+  // recursive forking branch: trunk -> limbs -> branches -> twigs (+leaves)
+  function branch(pos, dir, len, rad, depth){
+    // tapered segment, slight natural curve via mid-offset
+    const seg = new THREE.CylinderGeometry(rad*0.62, rad, len, 7, 3);
+    seg.translate(0, len/2, 0);
+    // bend: offset middle vertices perpendicular for organic curve
+    const pp = seg.attributes.position;
+    for(let i=0;i<pp.count;i++){
+      const t = pp.getY(i)/len;
+      const bendAmt = Math.sin(t*Math.PI) * len * 0.08;
+      pp.setX(i, pp.getX(i) + bendAmt*0.6);
+      pp.setZ(i, pp.getZ(i) + bendAmt*0.35);
+    }
+    seg.computeVertexNormals();
+    // orient along dir
+    const q = new THREE.Quaternion().setFromUnitVectors(UP, dir.clone().normalize());
+    seg.applyQuaternion(q);
+    seg.translate(pos.x, pos.y, pos.z);
+    branchGeos.push(seg);
+
+    const tip = pos.clone().addScaledVector(dir, len);
+
+    if(depth <= 0){
+      // leaf tuft at twig tip (small, so branch structure shows through)
+      const r = (0.42+rnd()*0.28)*s;
+      puffXforms.push({
+        pos: tip.clone().addScaledVector(dir, r*0.35),
+        scale: r,
+        rotY: rnd()*Math.PI*2,
+        squash: 0.72+rnd()*0.2,
+      });
+      return;
+    }
+    // fork into children
+    const nChild = depth >= 3 ? 3+Math.floor(rnd()*2) : 2+Math.floor(rnd()*2);
+    const baseA = rnd()*Math.PI*2;
+    for(let i=0;i<nChild;i++){
+      // distribute around parent with golden-angle + jitter
+      const az = baseA + i*2.39996 + (rnd()-0.5)*0.7;
+      const tilt = 0.42+rnd()*0.42; // 24-48 deg from parent
+      // build child dir: rotate parent dir by tilt around horizontal axis at azimuth
+      const ax = new THREE.Vector3(Math.cos(az), 0, Math.sin(az));
+      const ndir = dir.clone().applyAxisAngle(ax, tilt);
+      // upward bias (phototropism) — stronger for higher branches
+      ndir.y += 0.22 + depth*0.06;
+      ndir.normalize();
+      // occasional downward droop for natural irregularity
+      if(rnd() < 0.18) ndir.y -= 0.35;
+      ndir.normalize();
+      branch(tip, ndir, len*(0.60+rnd()*0.16), rad*0.60, depth-1);
+    }
   }
-  // canopy: dense overlapping puffs in an irregular ellipsoid volume
-  const npuff = 10 + Math.floor(rnd()*3);
-  for(let i=0;i<npuff;i++){
-    const r = (0.7+rnd()*0.6)*s;
-    const puff = new THREE.Mesh(makePuff(r, 0.62+rnd()*0.25, seed+i*7.3), makeFoliageMat(r));
-    // golden-angle spiral fill, denser toward center-top
-    const ga = i*2.39996 + rnd()*0.5;
-    const rr = Math.sqrt(rnd())*1.35*s;
-    const hy = (rnd()*0.9+0.35);
-    puff.position.set(Math.cos(ga)*rr, trunkH*(0.78+hy*0.45), Math.sin(ga)*rr*0.85);
-    puff.rotation.y = rnd()*Math.PI*2;
-    crown.add(puff);
-  }
-  g.add(crown);
-  g.position.set(x, terrainH(x,z)-0.05, z);
+
+  // trunk: slight lean, root flare handled by radius
+  const lean = new THREE.Vector3((rnd()-0.5)*0.24, 1, (rnd()-0.5)*0.24).normalize();
+  // start slightly below ground so base is buried
+  branch(new THREE.Vector3(0,-0.25*s,0), lean, 2.7*s, 0.30*s, 3);
+
+  // merge all branch segments into one mesh (1 draw call)
+  const merged = mergeGeometries(branchGeos, false);
+  branchGeos.forEach(bg => bg.dispose());
+  g.add(new THREE.Mesh(merged, barkMat));
+
+  // leaves: instanced puffs at twig tips (1 draw call)
+  const inst = new THREE.InstancedMesh(puffGeo, puffMat, puffXforms.length);
+  const m4 = new THREE.Matrix4(), qq = new THREE.Quaternion(),
+        ee = new THREE.Euler(), vv = new THREE.Vector3(), ss = new THREE.Vector3();
+  puffXforms.forEach((pf, i)=>{
+    ee.set(0, pf.rotY, 0); qq.setFromEuler(ee);
+    vv.copy(pf.pos); ss.set(pf.scale, pf.scale*pf.squash, pf.scale);
+    m4.compose(vv, qq, ss); inst.setMatrixAt(i, m4);
+  });
+  inst.instanceMatrix.needsUpdate = true;
+  g.add(inst);
+
+  g.position.set(x, terrainH(x,z), z);
   g.rotation.y = rnd()*Math.PI*2;
   scene.add(g);
-  treeCrowns.push(g); // whole-tree sway (subtle); leaf flutter is in-shader
+  treeCrowns.push(g); // whole-tree sway; leaf flutter is in-shader
 }
-makeBush(7,-1.5,1.1,11); makeBush(-6.5,-5.5,0.9,23); makeBush(-2,6.5,1.2,37); makeBush(12.5,7.5,0.8,51);
 makeTree(4.5, -3.5, 1.25, 101); makeTree(-5.5, 2.0, 1.0, 202); makeTree(1.5, -7.5, 0.85, 303);
 makeTree(-9, 7, 1.1, 404); makeTree(9.5, -8, 0.9, 505);
 
