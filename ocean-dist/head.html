@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Scene Engine — Ocean (our own)</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;}
+  #app{position:relative;width:1280px;height:720px;}
+  canvas{display:block;}
+  #fade{position:absolute;inset:0;background:#000;opacity:1;pointer-events:none;}
+  #hint{position:absolute;left:12px;bottom:10px;color:#fff;font:13px system-ui;opacity:.55;pointer-events:none;}
+</style>
+</head>
+<body>
+<div id="app"><div id="fade"></div><div id="hint"></div><div id="boot"></div></div>
+<script>
+window.__bootLog = [];
+window.__boot = function(m){ window.__bootLog.push(m);
+  var el = document.getElementById('boot');
+  if (el) el.textContent = window.__bootLog.join(' · ');
+};
+window.addEventListener('error', function(e){
+  window.__boot('ERR: ' + String(e.message || e.error).slice(0, 120));
+});
+</script>
+<style>
+  #boot{position:absolute;left:12px;top:10px;color:#fff;font:12px system-ui;opacity:.85;pointer-events:none;text-shadow:0 1px 3px #000;z-index:5;max-width:90%;}
+</style>
